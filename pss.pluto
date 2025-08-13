@@ -1,0 +1,283 @@
+local bigint = require "bigint"
+local crypto = require "crypto"
+require "u64_dyn"
+
+if not bigint.import then
+	function bigint.import(binary)
+		local x = bigint.new()
+		local m <const> = bigint.new(256)
+		for binary:split("") as b do
+			x *= m
+			x += bigint.new(string.byte(b))
+		end
+		return x
+	end
+end
+
+if not bigint.export then
+	function bigint.export(x)
+		local t = {}
+		local m <const> = bigint.new(256)
+		while bigint.tostring(x) ~= "0" do
+			t:insert(1, string.char(bigint.tostring(x % m)))
+			x /= m
+		end
+		return t:concat("")
+	end
+end
+
+local pss = {}
+
+enum begin
+	PSS_AUTH_PASSCODE = 0,
+	PSS_AUTH_PUBKEY_REQUEST = 1,
+	PSS_AUTH_PUBKEY_CHALLENGE = 2,
+	PSS_AUTH_PUBKEY_FINISH = 3,
+	PSS_AUTHED = 4,
+	PSS_CLOSE = 5,
+	PSS_REKEY = 6,
+	PSS_NO_AUTH = 7,
+end
+
+function pss.tcpwrap(sock)
+	return |data| -> sock:send(data), || -> sock:recv(), || -> sock:close()
+end
+
+function pss.wswrap(sock)
+	return |data| -> sock:wsSend(data), || -> sock:wsRecv(), || -> sock:close()
+end
+
+class pss.connection
+	function __construct(public transport_send, public transport_recv, public transport_close)
+	end
+
+	function send(data, is_pss)
+		--local og_size = #data
+		local size = #data
+		if is_pss then
+			size = ~size
+		end
+		local size_enc = pack_i64_dyn_v2(size)
+		local explicit_iv = range(4):map(|| -> string.char(math.random(0x00, 0xFF))):concat("")
+		local iv = explicit_iv .. ">I8":pack(self.send_seq) self.send_seq += 1
+		local auth_tag
+		data, auth_tag = crypto.encrypt(data, "aes-gcm", size_enc, self.send_key, iv)
+		--assert(og_size == #data)
+		--assert(#auth_tag == 16)
+		self.transport_send(size_enc .. explicit_iv .. data .. auth_tag)
+	end
+
+	function recv(raw)
+		local data = self.unrecv
+		if data then
+			self.unrecv = nil
+		else
+			data = self.transport_recv()
+		end
+		local is_pss
+		if data then
+			local size, i = unpack_i64_dyn_v2(data)
+			is_pss = size < 0
+			if is_pss then
+				size = ~size
+			end
+			local size_enc = data:sub(1, i - 1)
+			data = data:sub(i)
+			while #data < (size + 20) do
+				data ..= self.transport_recv()
+			end
+			if #data > (size + 20) then
+				self.unrecv = data:sub(size + 21)
+				data = data:sub(1, size + 20)
+			end
+			local explicit_iv = data:sub(1, 4)
+			local auth_tag = data:sub(5 + size)
+			assert(#auth_tag == 16)
+			data = data:sub(5, 4 + size)
+			assert(#data == size)
+			local iv = explicit_iv .. ">I8":pack(self.recv_seq) self.recv_seq += 1
+			data = crypto.decrypt(data, "aes-gcm", size_enc, self.recv_key, iv, auth_tag)
+			if is_pss then
+				switch data:byte(1) do
+					case PSS_AUTH_PASSCODE:
+					case PSS_AUTH_PUBKEY_REQUEST:
+					case PSS_AUTH_PUBKEY_CHALLENGE:
+					case PSS_AUTH_PUBKEY_FINISH:
+					break
+
+					case PSS_AUTHED:
+					self.authed = true
+					if not raw then
+						return self:recv()
+					end
+					break
+
+					case PSS_NO_AUTH:
+					self.authed = false
+					if not raw then
+						return self:recv()
+					end
+					break
+
+					case PSS_REKEY:
+					assert(#data == 17)
+					self.recv_key = data:sub(2)
+					assert(#self.recv_key == 16)
+					self.recv_seq = 0
+					if not raw then
+						return self:recv()
+					end
+					break
+
+					case PSS_CLOSE:
+					self.transport_close()
+					return
+
+					default:
+					;(data:byte(1) < 128 ? error : print)("unknown pss message type: "..data:byte(1))
+				end
+			end
+		end
+		return data, is_pss
+	end
+
+	function close()
+		if self.send_seq then
+			self:send(string.char(PSS_CLOSE), true)
+		end
+		self.transport_close()
+	end
+
+	function rekey()
+		local new_key = range(16):map(|| -> string.char(math.random(0x00, 0xFF))):concat("")
+		self:send(string.char(PSS_REKEY) .. new_key, true)
+		self.send_key = new_key
+		self.send_seq = 0
+	end
+end
+
+class pss.client extends pss.connection
+	function startRaw(remote_pub)
+		self.send_key = range(16):map(|| -> string.char(math.random(0x00, 0xFF))):concat("")
+		self.recv_key = range(16):map(|| -> string.char(math.random(0x00, 0xFF))):concat("")
+		local data = crypto.encrypt(self.send_key .. self.recv_key, "rsa-pkcs1", remote_pub)
+		self.transport_send(pack_u64_dyn_v2(0) .. pack_u64_dyn_v2(#data) .. data)
+		self.send_seq = 0
+		self.recv_seq = 0
+	end
+
+	function start(remote_pub)
+		self:startRaw(remote_pub)
+		self:send(string.char(PSS_NO_AUTH), true)
+		self.authed = false
+	end
+
+	function startPasscode(remote_pub, passcode)
+		self:startRaw(remote_pub)
+		self:send(string.char(PSS_AUTH_PASSCODE) .. passcode, true)
+	end
+
+	function startPubkey(remote_pub, my_priv)
+		self:startRaw(remote_pub)
+		self:send(string.char(PSS_AUTH_PUBKEY_REQUEST), true)
+		local data, is_pss = self:recv()
+		if data then
+			assert(is_pss)
+			assert(data:byte(1) == PSS_AUTH_PUBKEY_CHALLENGE)
+			local my_pub_n = (my_priv.p * my_priv.q):export()
+			local sig = crypto.sign(data:sub(2), "rsa-sha256", my_priv)
+			self:send(string.char(PSS_AUTH_PUBKEY_FINISH) .. pack_u64_dyn_v2(#my_pub_n) .. my_pub_n .. pack_u64_dyn_v2(#sig) .. sig, true)
+		end
+	end
+
+	function isAuthed()
+		if self.authed == nil then
+			local data, is_pss = self:recv(true)
+			if data then
+				assert(is_pss)
+			end
+		end
+		return self.authed
+	end
+end
+
+class pss.host extends pss.connection
+	function start(my_priv, is_trusted_key, passcode: ?string)
+		local data = self.transport_recv()
+		if data then
+			local flags, i = unpack_u64_dyn_v2(data)
+			assert(flags == 0)
+			data = data:sub(i)
+			local size
+			size, i = unpack_u64_dyn_v2(data)
+			data = data:sub(i)
+			while #data < size do
+				data ..= self.transport_recv()
+			end
+			if #data > size then
+				self.unrecv = data:sub(1 + size)
+				data = data:sub(1, size)
+			end
+			data = crypto.decrypt(data, "rsa-pkcs1", my_priv)
+			assert(#data == 32)
+			self.recv_key = data:sub(1, 16)
+			self.send_key = data:sub(17, 32)
+			self.send_seq = 0
+			self.recv_seq = 0
+
+			local is_pss
+			data, is_pss = self:recv()
+			if data then
+				if not is_pss then
+					error("unexpected application data during pss handshake: " .. data:tohex())
+				end
+				switch data:byte(1) do
+					case PSS_AUTH_PASSCODE:
+					self.authed = (passcode == data:sub(2))
+					self:send(string.char(self.authed ? PSS_AUTHED : PSS_NO_AUTH), true)
+					break
+
+					case PSS_AUTH_PUBKEY_REQUEST:
+					do
+						local challenge = range(32):map(|| -> string.char(math.random(0x00, 0xFF))):concat("")
+						self:send(string.char(PSS_AUTH_PUBKEY_CHALLENGE) .. challenge, true)
+						data, is_pss = self:recv()
+						if data then
+							assert(is_pss)
+							assert(data:byte(1) == PSS_AUTH_PUBKEY_FINISH)
+							local remote_pub_len
+							remote_pub_len, i = unpack_u64_dyn_v2(data, 2)
+							local remote_pub = {
+								n = bigint.import(data:sub(i, i + remote_pub_len - 1)),
+								e = bigint.new(0x10001),
+							}
+							i += remote_pub_len
+							local sig_len
+							sig_len, i = unpack_u64_dyn_v2(data, i)
+							local sig = data:sub(i, i + sig_len - 1)
+							if not is_trusted_key(remote_pub) then
+								print("Remote pub is not trusted: "..dumpvar(remote_pub))
+							end
+							--print("crypto.verify result", crypto.verify(challenge, "rsa-sha256", remote_pub, sig))
+							self.authed = is_trusted_key(remote_pub) and crypto.verify(challenge, "rsa-sha256", remote_pub, sig)
+							self:send(string.char(self.authed ? PSS_AUTHED : PSS_NO_AUTH), true)
+						end
+					end
+					break
+
+					case PSS_NO_AUTH:
+					break
+
+					default:
+					error("unexpected pss message type: "..data:byte(1))
+				end
+			end
+		end
+	end
+
+	function isAuthed()
+		return self.authed
+	end
+end
+
+return pss
