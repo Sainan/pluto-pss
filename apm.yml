@@ -1,1 +1,3 @@
 lib: pss.pluto
+depends:
+  https://gist.github.com/Sainan/02c3ac9cea5015341412c92feec95e56: *
